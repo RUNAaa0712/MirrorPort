@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -25,23 +26,38 @@ const (
 )
 
 type receiverOptions struct {
-	Name    string `json:"name"`
-	Display string `json:"display"`
-	FPS     int    `json:"fps"`
-
-	Muted bool `json:"muted"`
+	Name          string `json:"name"`
+	Display       string `json:"display"`
+	FPS           int    `json:"fps"`
+	Source        string `json:"source"`
+	VideoDevice   string `json:"videoDevice"`
+	AudioDevice   string `json:"audioDevice"`
+	Resolution    string `json:"resolution"`
+	JPEGQuality   int    `json:"jpegQuality"`
+	Muted         bool   `json:"muted"`
+	Volume        *int   `json:"volume"`
+	AirPlayTiming string `json:"airplayTiming"`
 }
 
 type receiverStatus struct {
 	State string `json:"state"`
 
-	Name    string `json:"name,omitempty"`
-	Display string `json:"display,omitempty"`
-	PIN     string `json:"pin,omitempty"`
-	ID      string `json:"id,omitempty"`
+	Name        string         `json:"name,omitempty"`
+	Display     string         `json:"display,omitempty"`
+	PIN         string         `json:"pin,omitempty"`
+	ID          string         `json:"id,omitempty"`
+	Source      string         `json:"source,omitempty"`
+	Audio       *audioSettings `json:"audio,omitempty"`
+	Mosaic      *mosaicRegion  `json:"mosaic,omitempty"`
+	VideoDevice string         `json:"videoDevice,omitempty"`
 
 	Error string `json:"error,omitempty"`
 	Log   string `json:"log,omitempty"`
+}
+
+type audioSettings struct {
+	Volume int  `json:"volume"`
+	Muted  bool `json:"muted"`
 }
 
 type receiverSession struct {
@@ -53,6 +69,12 @@ type receiverSession struct {
 	stopping bool
 	status   receiverStatus
 	output   tailLog
+	// Gain is read by the PCM output loop. Zero covers both mute and zero volume.
+	gain          atomic.Int32
+	jpegQuality   int
+	mosaicVersion uint64
+	mosaicJobs    chan mosaicJob
+	hasVideo      bool
 }
 
 type receiver struct {
@@ -68,12 +90,14 @@ func (r *receiver) status() receiverStatus {
 	defer r.mu.Unlock()
 	if s := r.current; s != nil {
 		value := s.status
-		var listening bool
-		value.Log, listening = s.output.snapshot()
+		var listening, connected bool
+		value.Log, listening, connected = s.output.snapshot()
 		switch {
 		case s.stopping:
 			value.State = "stopping"
-		case len(s.last) != 0:
+		case s.hasVideo:
+			value.State = "playing"
+		case value.Display == "window" && connected:
 			value.State = "playing"
 		case listening:
 			value.State = "waiting"
@@ -86,14 +110,77 @@ func (r *receiver) status() receiverStatus {
 	return r.last
 }
 
+func (s *receiverSession) setAudio(settings audioSettings) {
+	s.status.Audio = &settings
+	gain := settings.Volume
+	if settings.Muted {
+		gain = 0
+	}
+	s.gain.Store(int32(gain))
+}
+
+func (r *receiver) updateAudio(id string, settings audioSettings) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.current
+	if s == nil || s.stopping || s.status.ID != id || s.status.Audio == nil {
+		return errors.New("音声を調整できる受信機が見つかりません。")
+	}
+	s.setAudio(settings)
+	return nil
+}
+
 func (r *receiver) start(options receiverOptions) error {
 	name := strings.TrimSpace(options.Name)
 	if name == "" || len(name) > 48 || !utf8.ValidString(name) || strings.ContainsAny(name, "\r\n\t\x00") || strings.HasPrefix(name, "-") {
 		return errors.New("受信機名は48バイト以内で入力してください。")
 	}
+	if options.FPS == 0 {
+		options.FPS = 60
+	}
 	if options.FPS != 24 && options.FPS != 30 && options.FPS != 60 {
 		return errors.New("フレームレートは 24、30、60 から選んでください。")
 	}
+	switch options.Resolution {
+	case "", "1920x1080", "1280x720":
+	default:
+		return errors.New("解像度を選んでください。")
+	}
+	switch options.JPEGQuality {
+	case 0, 3, 5, 8:
+	default:
+		return errors.New("JPEG画質を選んでください。")
+	}
+	if options.JPEGQuality == 0 {
+		options.JPEGQuality = 5
+	}
+	volume := 100
+	if options.Volume != nil {
+		volume = *options.Volume
+	}
+	if volume < 0 || volume > 100 {
+		return errors.New("音量は0〜100%で指定してください。")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.current != nil {
+		return errors.New("受信機は起動中です。")
+	}
+	audio := audioSettings{Volume: volume, Muted: options.Muted}
+	switch options.Source {
+	case "capture":
+		return r.startCapture(name, options, audio)
+	case "usb":
+		return r.startUSB(name, options, audio)
+	case "", "airplay":
+	default:
+		return errors.New("接続方法を選んでください。")
+	}
+	if options.AirPlayTiming != "" && options.AirPlayTiming != "low" && options.AirPlayTiming != "sync" {
+		return errors.New("AirPlayの同期設定を選んでください。")
+	}
+
 	path := r.tools.uxplay()
 	if path == "" {
 		return errors.New("AirPlay受信エンジンをセットアップしてください。")
@@ -115,11 +202,6 @@ func (r *receiver) start(options receiverOptions) error {
 		return errors.New("映像の表示先を選んでください。")
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.current != nil {
-		return errors.New("AirPlay受信機は起動中です。")
-	}
 	dir, err := os.MkdirTemp("", "mirrorport-")
 	if err != nil {
 		return fmt.Errorf("受信機の作業フォルダーを作成できません: %w", err)
@@ -134,7 +216,15 @@ func (r *receiver) start(options receiverOptions) error {
 	deviceID := net.HardwareAddr(append([]byte{0x02}, randomBytes(5)...)).String()
 	s := &receiverSession{
 		ctx: ctx, cancel: cancel, done: make(chan struct{}), changed: make(chan struct{}),
-		status: receiverStatus{State: "starting", Name: name, Display: display, PIN: code, ID: deviceID},
+		status:      receiverStatus{State: "starting", Name: name, Source: "airplay", Display: display, PIN: code, ID: deviceID},
+		jpegQuality: options.JPEGQuality,
+	}
+	s.setAudio(audio)
+	audioListener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		cancel()
+		_ = os.RemoveAll(dir)
+		return fmt.Errorf("音声用ポートを開けません: %w", err)
 	}
 	port := r.port
 	if port == 0 {
@@ -142,27 +232,34 @@ func (r *receiver) start(options receiverOptions) error {
 	}
 	args := []string{"-rc", "receiver.conf", "-n", name, "-nh", "-m", deviceID, "-pin", code, "-reg", "trusted.txt",
 		"-p", fmt.Sprint(port), "-fps", fmt.Sprint(options.FPS), "-nofreeze"}
+	synchronize := options.AirPlayTiming == "sync"
+	if !synchronize {
+		args = append(args, "-vsync", "no")
+	}
+	if options.Resolution != "" {
+		args = append(args, "-s", options.Resolution)
+	}
 	var listener net.Listener
 	if display == "browser" {
 		listener, err = net.Listen("tcp4", "127.0.0.1:0")
 		if err != nil {
 			cancel()
+			_ = audioListener.Close()
 			_ = os.RemoveAll(dir)
 			return fmt.Errorf("映像用ポートを開けません: %w", err)
 		}
 		port := listener.Addr().(*net.TCPAddr).Port
-		pipeline := fmt.Sprintf("config-interval=-1 ! rtph264depay ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! tcpclientsink host=127.0.0.1 port=%d sync=false async=false", port)
+		pipeline := fmt.Sprintf("config-interval=-1 ! rtph264depay ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! tcpclientsink host=127.0.0.1 port=%d sync=%t async=false", port, synchronize)
 		args = append(args, "-vrtp", pipeline)
 	} else {
 		args = append(args, "-vs", "d3d11videosink")
 	}
-	if options.Muted {
-		args = append(args, "-as", "0")
-	} else if bundledAudioNeedsRTP(path) {
-		// Some portable builds omit the level element used by the default sink.
-		// The L16 route can play locally using the included RTP and WASAPI plugins.
-		args = append(args, "-artp", "pt=96 ! rtpL16depay ! audioconvert ! audioresample ! wasapi2sink sync=false")
+	queue := "queue max-size-time=40000000 max-size-buffers=4 max-size-bytes=0 leaky=downstream"
+	if synchronize {
+		queue = "queue max-size-time=2000000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream"
 	}
+	args = append(args, "-artp", fmt.Sprintf("pt=96 ! rtpL16depay ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,rate=%d,channels=2 ! %s ! tcpclientsink host=127.0.0.1 port=%d sync=%t async=false",
+		audioRate, queue, audioListener.Addr().(*net.TCPAddr).Port, synchronize))
 	cmd := hiddenCommand(ctx, path, args...)
 	cmd.Dir, cmd.Stdout, cmd.Stderr = dir, &s.output, &s.output
 	cmd.WaitDelay = 2 * time.Second
@@ -176,6 +273,7 @@ func (r *receiver) start(options receiverOptions) error {
 	}
 	if err := cmd.Start(); err != nil {
 		cancel()
+		_ = audioListener.Close()
 		if listener != nil {
 			_ = listener.Close()
 		}
@@ -184,12 +282,14 @@ func (r *receiver) start(options receiverOptions) error {
 	}
 	r.current = s
 	r.last = receiverStatus{}
+	s.startMosaicWorker(r)
+	audioDone := s.startAudio(audioListener)
 	var videoDone chan struct{}
 	if listener != nil {
 		videoDone = make(chan struct{})
 		go func() {
 			defer close(videoDone)
-			r.receiveFrames(s, listener, ffmpeg)
+			r.receiveFrames(s, listener, ffmpeg, options.JPEGQuality)
 		}()
 	}
 	go func() {
@@ -199,31 +299,28 @@ func (r *receiver) start(options receiverOptions) error {
 			_ = listener.Close()
 			<-videoDone
 		}
+		<-audioDone
 		_ = os.RemoveAll(dir)
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		log, _ := s.output.snapshot()
-		r.last = receiverStatus{State: "idle", Log: log}
-		if !s.stopping {
-			r.last.State = "error"
-			r.last.Error = "AirPlay受信機が終了しました。受信ログを確認してください。"
-			if err != nil {
-				r.last.Error += " (" + err.Error() + ")"
-			}
-		}
-		r.current = nil
-		close(s.done)
+		r.finish(s, "AirPlay受信機が終了しました。受信ログを確認してください。", err)
 	}()
 	return nil
 }
 
-func bundledAudioNeedsRTP(enginePath string) bool {
-	plugins := filepath.Join(filepath.Dir(enginePath), "gstreamer-1.0")
-	info, err := os.Stat(plugins)
-	if err != nil || !info.IsDir() {
-		return false
+func (r *receiver) finish(s *receiverSession, message string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	log, _, _ := s.output.snapshot()
+	r.last = receiverStatus{State: "idle", Log: log}
+	if !s.stopping {
+		r.last.State = "error"
+		r.last.Source = s.status.Source
+		r.last.Error = message
+		if err != nil {
+			r.last.Error += " (" + err.Error() + ")"
+		}
 	}
-	return firstFile(filepath.Join(plugins, "libgstlevel.dll"), filepath.Join(plugins, "gstlevel.dll")) == ""
+	r.current = nil
+	close(s.done)
 }
 
 func (r *receiver) stop() <-chan struct{} {
@@ -249,6 +346,26 @@ func (r *receiver) shutdown() {
 func (r *receiver) setFrame(s *receiverSession, frame []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if s.stopping {
+		return
+	}
+	s.hasVideo = len(frame) != 0
+	if !s.hasVideo {
+		s.mosaicVersion++
+	}
+	if mask := s.status.Mosaic; mask != nil && s.hasVideo {
+		job := mosaicJob{frame: frame, region: *mask, version: s.mosaicVersion}
+		select {
+		case <-s.mosaicJobs:
+		default:
+		}
+		s.mosaicJobs <- job
+		return
+	}
+	s.replaceFrame(frame)
+}
+
+func (s *receiverSession) replaceFrame(frame []byte) {
 	s.last = frame
 	close(s.changed)
 	s.changed = make(chan struct{})
@@ -275,14 +392,14 @@ func readFrames(input io.Reader, publish func([]byte)) error {
 	}
 }
 
-func (r *receiver) receiveFrames(s *receiverSession, listener net.Listener, ffmpeg string) {
+func (r *receiver) receiveFrames(s *receiverSession, listener net.Listener, ffmpeg string, quality int) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			return
 		}
 		stop := context.AfterFunc(s.ctx, func() { _ = conn.Close() })
-		err = decodeFrames(s.ctx, ffmpeg, conn, &s.output, func(frame []byte) { r.setFrame(s, frame) })
+		err = decodeFrames(s.ctx, ffmpeg, conn, &s.output, quality, func(frame []byte) { r.setFrame(s, frame) })
 		stop()
 		_ = conn.Close()
 		r.setFrame(s, nil)
@@ -292,15 +409,20 @@ func (r *receiver) receiveFrames(s *receiverSession, listener net.Listener, ffmp
 	}
 }
 
-func decodeFrames(ctx context.Context, ffmpeg string, input net.Conn, output io.Writer, publish func([]byte)) error {
+func jpegOutputArgs(quality int) []string {
+	return []string{"-an", "-c:v", "mjpeg", "-q:v", fmt.Sprint(quality), "-threads", "2", "-flush_packets", "1",
+		"-fps_mode", "passthrough", "-f", "mpjpeg", "-boundary_tag", boundary, "pipe:1"}
+}
+
+func decodeFrames(ctx context.Context, ffmpeg string, input net.Conn, output io.Writer, quality int, publish func([]byte)) error {
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cmd := hiddenCommand(childCtx, ffmpeg,
+	args := []string{
 		"-hide_banner", "-loglevel", "warning", "-nostdin",
 		"-probesize", "8192", "-analyzeduration", "100000", "-flags", "low_delay",
 		"-f", "h264", "-threads", "2", "-i", "pipe:0",
-		"-an", "-c:v", "mjpeg", "-q:v", "5", "-threads", "2", "-flush_packets", "1",
-		"-fps_mode", "passthrough", "-f", "mpjpeg", "-boundary_tag", boundary, "pipe:1")
+	}
+	cmd := hiddenCommand(childCtx, ffmpeg, append(args, jpegOutputArgs(quality)...)...)
 	cmd.Stdin = input
 	cmd.Stderr = output
 	cmd.WaitDelay = 2 * time.Second
@@ -385,6 +507,7 @@ type tailLog struct {
 	mu        sync.Mutex
 	data      []byte
 	listening bool
+	connected bool
 }
 
 func (l *tailLog) Write(p []byte) (int, error) {
@@ -394,14 +517,19 @@ func (l *tailLog) Write(p []byte) (int, error) {
 	if !l.listening {
 		l.listening = bytes.Contains(l.data, []byte("Initialized server socket(s)"))
 	}
+	start := bytes.LastIndex(l.data, []byte("begin video stream wxh"))
+	stop := max(bytes.LastIndex(l.data, []byte("video stream is stopping")), bytes.LastIndex(l.data, []byte("TEARDOWN request,  96=")))
+	if start != -1 || stop != -1 {
+		l.connected = start > stop
+	}
 	if max := 8000; len(l.data) > max {
 		l.data = append([]byte(nil), l.data[len(l.data)-max:]...)
 	}
 	return len(p), nil
 }
 
-func (l *tailLog) snapshot() (string, bool) {
+func (l *tailLog) snapshot() (string, bool, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return strings.ToValidUTF8(string(l.data), "�"), l.listening
+	return strings.ToValidUTF8(string(l.data), "�"), l.listening, l.connected
 }

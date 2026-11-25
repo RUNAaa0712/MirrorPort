@@ -22,7 +22,7 @@ try {
     & go build -trimpath -buildvcs=false -o $exe .
     if ($LASTEXITCODE -ne 0) { throw 'MirrorPort build failed.' }
 
-    Copy-Item -LiteralPath 'README.md','setup-airplay.cmd','setup-airplay.ps1' -Destination $package
+    Copy-Item -LiteralPath 'README.md','setup-airplay.cmd','setup-airplay.ps1','setup-usb.ps1' -Destination $package
     $archive = Join-Path $dist "$stem.zip"
     Compress-Archive -LiteralPath $package -DestinationPath $archive -Force
     $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()

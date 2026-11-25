@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>MirrorPort — AirPlay</title>
+  <title>MirrorPort — iPhoneミラーリング</title>
   <link rel="stylesheet" href="/style.css">
   <script type="module" src="/app.js"></script>
 </head>
@@ -12,24 +12,40 @@
   <header class="top">
     <div class="wrap top-inner">
       <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"></span>MirrorPort</a>
+      <nav class="top-nav" aria-label="ページ内メニュー"><a href="#receivers">受信機</a><a href="#performance">PCの状態</a></nav>
       <div class="top-actions"><span id="connection" class="connection" role="status"><i></i>起動を確認中</span><button id="quit" class="quiet" type="button" disabled>終了</button></div>
     </div>
   </header>
   <main class="wrap">
     <div class="heading">
-      <div><p class="eyebrow">AIRPLAY · WINDOWS</p><h1>ミラーリング</h1><p class="intro">iPhoneの画面を並べて表示し、OBSで端末ごとに取り込みます。</p></div>
-      <button id="add" class="primary" type="button"><span aria-hidden="true">＋</span> 受信機を追加</button>
+      <div><h1>ミラーリング</h1><p class="intro">iPhoneの映像とWindowsへの音声を、受信機ごとに管理します。</p></div>
+      <div class="workspace-actions"><button id="add" class="primary" type="button"><span aria-hidden="true">＋</span> 受信機を追加</button><span id="capacity" class="capacity"></span></div>
     </div>
     <p id="dependency" class="notice" hidden></p>
-    <div class="section-bar">
-      <div><h2>プレビュー</h2><span id="summary">ブラウザー表示 0 台</span></div>
-      <div class="segmented" role="group" aria-label="プレビュー表示">
-        <button type="button" data-layout="grid" aria-pressed="true">並べる</button>
-        <button type="button" data-layout="list" aria-pressed="false">縦に並べる</button>
+    <section id="performance" class="performance" aria-labelledby="performance-title">
+      <div class="section-bar">
+        <h2 id="performance-title">PCの状態</h2>
+        <span id="performance-status" class="section-note">直近60秒 · 測定中</span>
       </div>
-    </div>
-    <div id="cards" class="cards"></div>
-    <div class="help"><span aria-hidden="true">ⓘ</span><p>iPhoneとPCを同じネットワークに接続し、iPhoneの「画面ミラーリング」で各カードの受信機名を選びます。</p></div>
+      <div class="metrics">
+        <article class="metric" data-metric="cpu"><h3>CPU</h3><p class="metric-value">—</p><canvas class="trace" width="280" height="48" aria-hidden="true"></canvas><p class="metric-note">全体の使用率</p></article>
+        <article class="metric" data-metric="memory"><h3>メモリ</h3><p class="metric-value">—</p><canvas class="trace" width="280" height="48" aria-hidden="true"></canvas><p class="metric-note">物理メモリ</p></article>
+        <article class="metric" data-metric="gpu"><h3>GPU</h3><p class="metric-value">—</p><canvas class="trace" width="280" height="48" aria-hidden="true"></canvas><p class="metric-note">最も負荷の高いエンジン</p></article>
+        <article class="metric" data-metric="disk"><h3>ディスク</h3><p class="metric-value">—</p><canvas class="trace" width="280" height="48" aria-hidden="true"></canvas><p class="metric-note">最も負荷の高いドライブ</p></article>
+      </div>
+    </section>
+    <section id="receivers" aria-labelledby="receivers-title">
+      <div class="section-bar receivers-bar">
+        <div class="section-heading"><h2 id="receivers-title">プレビュー</h2><span id="summary" class="section-note">表示中 0 台</span></div>
+        <div class="segmented" role="group" aria-label="プレビュー表示">
+          <button type="button" data-layout="grid" aria-pressed="true">グリッド</button>
+          <button type="button" data-layout="list" aria-pressed="false">縦並び</button>
+          <button type="button" data-layout="focus" aria-pressed="false">フォーカス</button>
+        </div>
+      </div>
+      <div id="focus-picker" class="focus-picker" role="group" aria-label="表示する受信機" hidden></div>
+      <div id="cards" class="cards"></div>
+    </section>
     <p id="feedback" class="toast" role="status" hidden></p>
   </main>
   <template id="card-template">
@@ -40,36 +56,60 @@
         <span class="state" data-state="idle"><i></i><span>未接続</span></span>
       </header>
       <div class="stage">
-        <div class="placeholder"><div class="phone" aria-hidden="true"></div><strong></strong><p></p></div>
+        <div class="placeholder"><div class="phone" aria-hidden="true"><span></span></div><strong></strong><p></p></div>
         <img alt="iPhoneのライブプレビュー" hidden>
+        <canvas class="mosaic-layer" aria-hidden="true" hidden></canvas>
         <div class="pin" hidden>接続コード <strong></strong></div>
       </div>
       <div class="actions">
-        <button type="button" class="start primary">受信を開始</button>
-        <button type="button" class="stop" hidden>受信を停止</button>
-        <button type="button" class="obs-copy">OBS URLをコピー</button>
-        <button type="button" class="fullscreen quiet" disabled>全画面</button>
-        <button type="button" class="snapshot quiet" disabled>画像保存</button>
+        <div class="transport-actions">
+          <button type="button" class="start primary"><span aria-hidden="true" class="play-icon"></span>受信を開始</button>
+          <button type="button" class="stop" hidden><span aria-hidden="true" class="stop-icon"></span>受信を停止</button>
+        </div>
+        <div class="preview-actions" role="group" aria-label="映像の操作">
+          <button type="button" class="fullscreen quiet" disabled>全画面</button>
+          <button type="button" class="snapshot quiet" disabled>画像保存</button>
+          <button type="button" class="mosaic-select quiet" disabled>モザイク範囲</button>
+          <button type="button" class="mosaic-clear quiet" hidden>解除</button>
+        </div>
+      </div>
+      <p class="selection-hint" role="status" hidden>映像の上をドラッグして範囲を選択します。</p>
+      <div class="device-controls">
+        <label>接続方法<select class="source"><option value="airplay">AirPlay（Wi-Fi）</option><option value="usb">USBケーブルで直接接続</option><option value="capture">HDMIキャプチャー</option></select></label>
+        <div class="volume-control">
+          <label><span>Windowsへの音量 <output class="volume-value">100%</output></span><input class="volume" type="range" min="0" max="100" value="100"></label>
+          <button type="button" class="mute" aria-pressed="false">ミュート</button>
+        </div>
+        <div class="capture-fields" hidden>
+          <label><span class="input-device-label">映像デバイス</span><select class="capture-video"><option value="">選択してください</option></select></label>
+          <label class="capture-audio-field">HDMI音声デバイス<select class="capture-audio"><option value="">なし</option></select></label>
+          <button type="button" class="capture-refresh quiet">機器一覧を更新</button>
+          <p class="usb-help" hidden>初回はiPhoneをロック解除して「信頼」を押し、iPhoneMirrorのドライバー管理ツールで対象端末を準備してください。</p>
+        </div>
       </div>
       <div class="card-bottom">
-        <details class="options">
-          <summary>受信設定</summary>
+        <div class="obs-actions"><button type="button" class="obs-guide quiet"><span class="link-icon" aria-hidden="true"></span> OBS設定</button><button type="button" class="obs-copy quiet">URLをコピー</button></div>
+        <button type="button" class="options-open quiet">高度な設定</button>
+        <dialog class="options">
+          <div class="dialog-header"><h2>高度な設定</h2><button type="button" class="options-close quiet">閉じる</button></div>
+          <p class="options-lock intro" hidden>受信を停止すると設定を変更できます。</p>
           <div class="settings">
             <label>受信機名<input class="name" maxlength="48" spellcheck="false" required></label>
-            <label>フレームレート<select class="fps"><option value="24">24 fps</option><option value="30" selected>30 fps</option><option value="60">60 fps</option></select></label>
-            <label>Windowsへの音声<select class="audio"><option value="off">ミュート</option><option value="on">再生</option></select></label>
-            <label>表示先<select class="display"><option value="auto">自動</option><option value="browser">ブラウザー・OBS</option><option value="window">Windowsウィンドウ</option></select></label>
+            <label>フレームレート<select class="fps"><option value="24">24 fps</option><option value="30">30 fps</option><option value="60" selected>60 fps</option></select></label>
+            <label><span class="resolution-label">入力解像度</span><select class="resolution"><option value="">自動</option><option value="1920x1080">1080p</option><option value="1280x720">720p</option></select></label>
+            <label>JPEG画質<select class="quality"><option value="3">高画質</option><option value="5" selected>標準</option><option value="8">軽量</option></select></label>
+            <label class="display-field">表示先<select class="display"><option value="auto">自動</option><option value="browser">ブラウザー・OBS</option><option value="window">Windowsウィンドウ</option></select></label>
+            <label class="airplay-timing-field">AirPlayの同期<select class="airplay-timing"><option value="low">低遅延</option><option value="sync">映像と音声の同期を優先</option></select></label>
             <details class="logs"><summary>受信ログ</summary><pre></pre></details>
           </div>
-        </details>
-        <button type="button" class="obs-guide quiet">OBS設定</button>
+        </dialog>
       </div>
       <p class="error notice" role="alert" hidden></p>
     </article>
   </template>
   <dialog id="obs-dialog" aria-labelledby="obs-title">
     <form method="dialog">
-      <div class="dialog-header"><div><p class="eyebrow">OBS BROWSER SOURCE</p><h2 id="obs-title">OBSへの取り込み</h2></div><button id="obs-close" class="quiet" type="button">閉じる</button></div>
+      <div class="dialog-header"><h2 id="obs-title">OBSへの取り込み</h2><button id="obs-close" class="quiet" type="button">閉じる</button></div>
       <ol><li>OBSの「ソース」で「ブラウザ」を追加します。</li><li>「ローカルファイル」をオフにし、下のURLを貼り付けます。</li><li>縦画面なら幅1080・高さ1920、横画面なら幅1920・高さ1080を目安に設定します。</li></ol>
       <label>OBSに貼り付けるURL<input id="obs-url" readonly></label>
       <p class="intro">映像用URLです。音声が必要な場合は、OBSでPCの出力音声を別途取り込んでください。</p>

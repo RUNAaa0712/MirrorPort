@@ -39,6 +39,7 @@ type application struct {
 	quit         chan struct{}
 	receivers    [slotCount]*receiver
 	tools        toolPaths
+	performance  *performanceMonitor
 	startMu      sync.Mutex
 	shuttingDown bool
 }
@@ -58,11 +59,12 @@ func main() {
 	}
 	tools := toolPaths{base: filepath.Dir(executable)}
 	app := &application{
-		origin: "http://" + listener.Addr().String(),
-		host:   listener.Addr().String(),
-		key:    hex.EncodeToString(randomBytes(32)),
-		quit:   make(chan struct{}, 1),
-		tools:  tools,
+		origin:      "http://" + listener.Addr().String(),
+		host:        listener.Addr().String(),
+		key:         hex.EncodeToString(randomBytes(32)),
+		quit:        make(chan struct{}, 1),
+		tools:       tools,
+		performance: startPerformanceMonitor(),
 	}
 	for i := range app.receivers {
 		app.receivers[i] = &receiver{tools: tools, port: firstAirPlayPort + i*3}
@@ -93,7 +95,10 @@ func main() {
 		}
 	}
 	_ = server.Close()
-	app.shutdown()
+	close(app.performance.stop)
+	if app.shutdown() {
+		shutdownUSBCore()
+	}
 }
 
 func (a *application) routes() http.Handler {
@@ -112,6 +117,8 @@ func (a *application) routes() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"state": status.State, "display": status.Display, "id": status.ID})
 	}))
 	mux.HandleFunc("GET /api/status", a.status)
+	mux.HandleFunc("GET /api/capture/devices", a.captureDevices)
+	mux.HandleFunc("GET /api/usb/devices", a.usbDevices)
 	start := func(s *receiver, w http.ResponseWriter, r *http.Request) { a.start(s, w, r) }
 	stop := func(s *receiver, w http.ResponseWriter, _ *http.Request) {
 		s.stop()
@@ -122,6 +129,8 @@ func (a *application) routes() http.Handler {
 		mux.HandleFunc("POST "+prefix+"/stop", a.slotHandler(stop))
 		mux.HandleFunc("GET "+prefix+"/video", a.slotHandler((*receiver).video))
 		mux.HandleFunc("GET "+prefix+"/snapshot", a.slotHandler((*receiver).snapshot))
+		mux.HandleFunc("POST "+prefix+"/audio", a.slotHandler((*receiver).audioSettings))
+		mux.HandleFunc("POST "+prefix+"/mosaic", a.slotHandler((*receiver).mosaicSettings))
 	}
 
 	mux.HandleFunc("POST /api/quit", func(w http.ResponseWriter, _ *http.Request) {
@@ -191,27 +200,33 @@ func (a *application) slotHandler(handle func(*receiver, http.ResponseWriter, *h
 	}
 }
 
-func (a *application) shutdown() {
+func (a *application) shutdown() bool {
 	a.startMu.Lock()
 	a.shuttingDown = true
 	wait := make([]<-chan struct{}, 0, slotCount)
+	timeoutDuration := 5 * time.Second
 	for _, s := range a.receivers {
 		if s != nil {
+			if s.status().Source == "usb" {
+				// A USB configuration switch can take up to 18 seconds.
+				timeoutDuration = 25 * time.Second
+			}
 			if done := s.stop(); done != nil {
 				wait = append(wait, done)
 			}
 		}
 	}
 	a.startMu.Unlock()
-	timeout := time.NewTimer(5 * time.Second)
+	timeout := time.NewTimer(timeoutDuration)
 	defer timeout.Stop()
 	for _, done := range wait {
 		select {
 		case <-done:
 		case <-timeout.C:
-			return
+			return false
 		}
 	}
+	return true
 }
 
 func (a *application) status(w http.ResponseWriter, _ *http.Request) {
@@ -227,14 +242,14 @@ func (a *application) status(w http.ResponseWriter, _ *http.Request) {
 		"slots":            slots,
 		"airplayInstalled": a.tools.uxplay() != "",
 		"ffmpegInstalled":  a.tools.ffmpeg() != "",
+		"usbInstalled":     a.tools.usbReady(),
+		"performance":      a.performance.snapshot(),
 	})
 }
 
 func (a *application) start(s *receiver, w http.ResponseWriter, r *http.Request) {
 	var options receiverOptions
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&options); err != nil || decoder.Decode(new(any)) != io.EOF {
+	if !decodeRequest(w, r, &options) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "受信設定を読み取れません。"})
 		return
 	}
@@ -249,7 +264,16 @@ func (a *application) start(s *receiver, w http.ResponseWriter, r *http.Request)
 			continue
 		}
 		status := other.status()
-		if status.ID != "" && strings.EqualFold(status.Name, strings.TrimSpace(options.Name)) {
+		if status.ID == "" {
+			continue
+		}
+		if (options.Source == "capture" || options.Source == "usb") &&
+			status.Source == options.Source && strings.EqualFold(status.VideoDevice, options.VideoDevice) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "別の受信機がこの映像デバイスを使用しています。"})
+			return
+		}
+		if (options.Source == "" || options.Source == "airplay") &&
+			status.Source == "airplay" && strings.EqualFold(status.Name, strings.TrimSpace(options.Name)) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "別の受信機が同じ名前を使用しています。異なる名前を指定してください。"})
 			return
 		}
@@ -259,6 +283,72 @@ func (a *application) start(s *receiver, w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, s.status())
+}
+
+func decodeRequest(w http.ResponseWriter, r *http.Request, value any) bool {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(value) == nil && decoder.Decode(new(any)) == io.EOF
+}
+
+func (a *application) captureDevices(w http.ResponseWriter, r *http.Request) {
+	ffmpeg := a.tools.ffmpeg()
+	if ffmpeg == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "有線入力にはFFmpegが必要です。"})
+		return
+	}
+	devices, err := listCaptureDevices(r.Context(), ffmpeg)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, devices)
+}
+
+func (a *application) usbDevices(w http.ResponseWriter, _ *http.Request) {
+	core, err := loadUSBCore(a.tools.usb())
+	if err == nil {
+		var devices []usbDevice
+		devices, err = core.listDevices()
+		if err == nil {
+			writeJSON(w, http.StatusOK, map[string]any{"video": devices})
+			return
+		}
+	}
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+}
+
+func (s *receiver) audioSettings(w http.ResponseWriter, r *http.Request) {
+	var options struct {
+		ID     string `json:"id"`
+		Volume *int   `json:"volume"`
+		Muted  bool   `json:"muted"`
+	}
+	if !decodeRequest(w, r, &options) || options.Volume == nil || *options.Volume < 0 || *options.Volume > 100 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "音量は0〜100%で指定してください。"})
+		return
+	}
+	if err := s.updateAudio(options.ID, audioSettings{Volume: *options.Volume, Muted: options.Muted}); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *receiver) mosaicSettings(w http.ResponseWriter, r *http.Request) {
+	var options struct {
+		ID     string        `json:"id"`
+		Region *mosaicRegion `json:"region"`
+	}
+	if !decodeRequest(w, r, &options) || (options.Region != nil && !options.Region.valid()) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "映像上でモザイクの範囲を選んでください。"})
+		return
+	}
+	if err := s.updateMosaic(options.ID, options.Region); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

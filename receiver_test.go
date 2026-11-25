@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
 	"image/jpeg"
 	"io"
 	"mime"
@@ -18,6 +21,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestMain(m *testing.M) {
@@ -54,6 +58,9 @@ func runReceiverFixture() error {
 	}
 	if len(arg("-pin")) != 4 || arg("-p") != port {
 		return fmt.Errorf("invalid receiver arguments")
+	}
+	if arg("-vsync") != "no" || !strings.Contains(arg("-artp"), "leaky=downstream") {
+		return fmt.Errorf("missing low-latency AirPlay settings")
 	}
 	if os.Getenv("MIRRORPORT_TEST_RECEIVER") == "window" {
 		if arg("-vs") != "d3d11videosink" || arg("-vrtp") != "" {
@@ -132,7 +139,7 @@ func TestIndependentPreviewsFromLiveH264(t *testing.T) {
 	r := testReceiver(t, "browser")
 	second := &receiver{port: 35003}
 	t.Cleanup(second.shutdown)
-	startBody := []byte(`{"display":"browser","name":"MirrorPort test","fps":30}`)
+	startBody := []byte(`{"display":"browser","name":"MirrorPort test"}`)
 	app := &application{key: "fixture-key", receivers: [slotCount]*receiver{r, second}}
 	server := httptest.NewUnstartedServer(app.routes())
 	app.host = server.Listener.Addr().String()
@@ -187,6 +194,13 @@ func TestIndependentPreviewsFromLiveH264(t *testing.T) {
 		t.Fatalf("preview state = %q", status.State)
 	}
 	waitReceiver(t, second, func(status receiverStatus) bool { return status.State == "playing" })
+	fixturePost(t, server.URL, "/api/airplay/2/audio", app.key,
+		[]byte(fmt.Sprintf(`{"id":%q,"volume":41,"muted":false}`, secondStatus.ID)), http.StatusNoContent)
+	if audio := second.status().Audio; audio == nil || audio.Volume != 41 || audio.Muted || second.current.gain.Load() != 41 {
+		t.Fatalf("unexpected live audio settings: %+v", audio)
+	}
+	fixturePost(t, server.URL, "/api/airplay/2/audio", app.key,
+		[]byte(fmt.Sprintf(`{"id":%q,"volume":80,"muted":true}`, startedStatus.ID)), http.StatusConflict)
 	state := httptest.NewRecorder()
 	app.routes().ServeHTTP(state, httptest.NewRequest("GET", server.URL+"/obs/2/state", nil))
 	var obs map[string]string
@@ -301,23 +315,125 @@ func TestLocalAccess(t *testing.T) {
 	}
 }
 
-func TestBundledAudioWithoutLevel(t *testing.T) {
-	dir := t.TempDir()
-	engine := filepath.Join(dir, "uxplay.exe")
-	if bundledAudioNeedsRTP(engine) {
-		t.Fatal("a system installation should keep the default audio pipeline")
+func TestPCMVolumeAndMute(t *testing.T) {
+	audio := []byte{0x00, 0x80, 0x00, 0x40}
+	scalePCM(audio, 50)
+	if left, right := int16(binary.LittleEndian.Uint16(audio)), int16(binary.LittleEndian.Uint16(audio[2:])); left != -16384 || right != 8192 {
+		t.Fatalf("half gain: %d, %d", left, right)
 	}
-	plugins := filepath.Join(dir, "gstreamer-1.0")
-	if err := os.Mkdir(plugins, 0700); err != nil {
+	scalePCM(audio, 0)
+	if !bytes.Equal(audio, make([]byte, len(audio))) {
+		t.Fatalf("mute: %v", audio)
+	}
+}
+
+func TestPCMQueueDropsOldestDuringBurst(t *testing.T) {
+	pcm := make(chan [audioBlockBytes]byte, 4)
+	data := make([]byte, 10*audioBlockBytes)
+	for block := range 10 {
+		data[block*audioBlockBytes] = byte(block)
+	}
+	queuePCM(context.Background(), bytes.NewReader(data), pcm)
+	var seen []byte
+	for block := range pcm {
+		seen = append(seen, block[0])
+	}
+	if !bytes.Equal(seen, []byte{6, 7, 8, 9}) {
+		t.Fatalf("playback queue contains stale blocks: %v", seen)
+	}
+}
+
+func TestUSBFrameABIAndColor(t *testing.T) {
+	if unsafe.Sizeof(usbCaptureOptions{}) != 48 || unsafe.Sizeof(usbFrameInfo{}) != 32 ||
+		unsafe.Sizeof(usbDeviceInfo{}) != 1184 || unsafe.Sizeof(usbCaptureStatus{}) != 464 {
+		t.Fatal("USB capture ABI no longer matches the x64 backend")
+	}
+	pixels := make([]byte, 8*8*4)
+	for offset := 0; offset < len(pixels); offset += 4 {
+		pixels[offset+2], pixels[offset+3] = 255, 255
+	}
+	encoded, err := encodeUSBFrame(pixels, usbFrameInfo{width: 8, height: 8, stride: 32, format: 1}, 5)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !bundledAudioNeedsRTP(engine) {
-		t.Fatal("a portable installation without level should use the RTP audio pipeline")
+	frame, err := jpeg.Decode(bytes.NewReader(encoded))
+	if err != nil || frame.Bounds().Size() != image.Pt(8, 8) {
+		t.Fatalf("invalid USB JPEG: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(plugins, "libgstlevel.dll"), nil, 0600); err != nil {
+	r, g, b, _ := frame.At(4, 4).RGBA()
+	if r < 60000 || g > 3000 || b > 3000 {
+		t.Fatalf("incorrect BGRA channel ordering: %d, %d, %d", r, g, b)
+	}
+}
+
+func TestCaptureListsStableDeviceNames(t *testing.T) {
+	devices := parseCaptureDevices(`[dshow @ 0] "USB Capture" (video)
+[dshow @ 0] Alternative name "@device_pnp_video#1"
+[dshow @ 0] "USB Capture" (video)
+[dshow @ 0] Alternative name "@device_pnp_video#2"
+[dshow @ 0] "Digital Audio (USB Capture)" (audio)
+[dshow @ 0] Alternative name "@device_cm_audio"
+[dshow @ 0] "Broken Device" (video)
+[dshow @ 0] Alternative name "@device_other:audio=other"
+Error opening input file dummy.`)
+	if len(devices.Video) != 2 || len(devices.Audio) != 1 || devices.Video[0].ID == devices.Video[1].ID {
+		t.Fatalf("unexpected devices: %+v", devices)
+	}
+	options := receiverOptions{VideoDevice: devices.Video[0].ID, AudioDevice: devices.Audio[0].ID, FPS: 60, JPEGQuality: 5}
+	args := strings.Join(captureArgs(options, "127.0.0.1:1234", "requested"), " ")
+	if !strings.Contains(args, "-framerate 60") ||
+		!strings.Contains(args, "video=@device_pnp_video#1:audio=@device_cm_audio") ||
+		!strings.Contains(args, "-map 0:a:0") {
+		t.Fatal(args)
+	}
+}
+
+func TestMosaicSnapshotUsesSelectedRegion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &receiverSession{
+		ctx: ctx, changed: make(chan struct{}), jpegQuality: 3,
+		status: receiverStatus{ID: "mask-fixture", Display: "browser"},
+	}
+	r := &receiver{current: s}
+	s.startMosaicWorker(r)
+	input := image.NewGray(image.Rect(0, 0, 128, 128))
+	for y := range 128 {
+		for x := range 128 {
+			if (x/3+y/3)%2 == 0 {
+				input.SetGray(x, y, color.Gray{Y: 255})
+			}
+		}
+	}
+	var jpegData bytes.Buffer
+	if err := jpeg.Encode(&jpegData, input, &jpeg.Options{Quality: 95}); err != nil {
 		t.Fatal(err)
 	}
-	if bundledAudioNeedsRTP(engine) {
-		t.Fatal("a portable installation with level should keep the default audio pipeline")
+	r.setFrame(s, jpegData.Bytes())
+	region := &mosaicRegion{Left: 2500, Top: 2500, Right: 7500, Bottom: 7500}
+	if err := r.updateMosaic("mask-fixture", region); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	r.snapshot(response, nil)
+	if response.Code != http.StatusNotFound {
+		t.Fatal("snapshot returned the last unprocessed frame")
+	}
+	changed := s.changed
+	r.setFrame(s, jpegData.Bytes())
+	select {
+	case <-changed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("processed frame did not arrive")
+	}
+	response = httptest.NewRecorder()
+	r.snapshot(response, nil)
+	result, err := jpeg.Decode(response.Body)
+	if err != nil || response.Code != http.StatusOK {
+		t.Fatalf("snapshot: %d %v", response.Code, err)
+	}
+	luma := func(x, y int) uint8 { return color.GrayModel.Convert(result.At(x, y)).(color.Gray).Y }
+	if luma(35, 35)/64 != luma(38, 35)/64 || luma(8, 8)/64 == luma(11, 8)/64 {
+		t.Fatal("pixelation did not stay inside the selected region")
 	}
 }
